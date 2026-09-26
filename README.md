@@ -1,4 +1,4 @@
-# Note: this fork was done with the assistance of generative AI, use it at your own risk!
+# Note: this fork was done with the assistance of generative AI for personal use on a frankestein A13 device, use it at your own risk!
 # tr4mpass: iCloud Activation Lock Bypass
 
 # New improved version will be released soon
