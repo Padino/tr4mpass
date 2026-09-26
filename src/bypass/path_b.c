@@ -14,7 +14,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <plist/plist.h>
-#include <libusb.h>
 #include <libimobiledevice/libimobiledevice.h>
 #include <libirecovery.h>
 
@@ -30,12 +29,8 @@
 
 /* Polling interval (2 s) and max wait for device mode transitions */
 #define REBOOT_POLL_USEC     2000000
-#define RECOVERY_WAIT_SECS   60
+#define RECOVERY_WAIT_SECS   120
 #define NORMAL_WAIT_SECS     90
-
-/* Apple USB IDs */
-#define APPLE_VID_PATH_B     0x05AC
-#define RECOVERY_PID_PATH_B  0x1281
 
 /* Forward declarations for module callbacks. */
 static int path_b_probe(device_info_t *dev);
@@ -81,75 +76,102 @@ static int path_b_probe(device_info_t *dev)
  * step_reboot_to_recovery -- Step 1/10: transition device from DFU to
  * recovery mode so that iRecovery setenv commands become available.
  *
- * Sends a DFU_ABORT class request which causes the device to reset.
- * On A12+ this typically lands in recovery mode (PID 0x1281).
- * Polls for recovery mode appearance up to RECOVERY_WAIT_SECS seconds.
+ * DFU_ABORT does not reboot an Apple device: it only returns the USB DFU
+ * state machine to dfuIDLE.  A stock A12+ device can be booted from DFU by
+ * software only after a correctly signed and personalised iBSS is uploaded.
+ * This path has no TSS/iBSS restore pipeline, so release the DFU handle and
+ * wait for the user to enter recovery with the hardware-button sequence.
+ *
+ * libirecovery is used for both discovery and mode verification.  This avoids
+ * treating a device that merely re-enumerated in DFU (PID 0x1227) as a
+ * successful transition and accepts every recovery PID (0x1280..0x1283).
  */
 static int step_reboot_to_recovery(device_info_t *dev)
 {
-    libusb_context  *ctx = NULL;
-    libusb_device  **devs = NULL;
-    ssize_t          count;
-    ssize_t          i;
-    int              elapsed = 0;
-    int              found   = 0;
+    irecv_client_t client = NULL;
+    irecv_error_t  err;
+    int            elapsed   = 0;
+    int            last_mode = 0;
+    int            mode;
 
-    log_info("[path_b] Step 1/10: Rebooting device from DFU to recovery mode...");
+    log_info("[path_b] Step 1/10: Switching device from DFU to recovery mode...");
 
     if (!dev->usb) {
         log_error("[path_b] No USB handle -- device not in DFU mode");
         return -1;
     }
 
-    /* DFU_ABORT: bmRequestType=0x21 (class, interface, host-to-device),
-     * bRequest=DFU_ABORT(6), wValue=0, wIndex=0, wLength=0 */
-    libusb_control_transfer(dev->usb, 0x21, 6, 0, 0, NULL, 0, 1000);
-
-    /* Release DFU handle -- device is resetting */
+    /* Do not send DFU_ABORT here.  It is a state-machine operation, not a
+     * reboot request, and leaves an iPhone 11 in DFU.  Release our claim so
+     * libirecovery can observe the device while the user changes mode. */
     usb_dfu_close(dev->usb);
-    dev->usb         = NULL;
-    dev->is_dfu_mode = 0;
+    dev->usb = NULL;
 
-    log_info("[path_b] DFU abort sent, waiting for recovery mode...");
-
-    if (libusb_init(&ctx) != LIBUSB_SUCCESS) {
-        log_error("[path_b] libusb_init failed for recovery poll");
-        return -1;
-    }
+    log_warn("[path_b] A stock A12+ device cannot be rebooted from DFU to "
+             "recovery with DFU_ABORT.");
+    log_info("[path_b] The ONLY way into recovery on this device is the "
+             "hardware button sequence:");
+    log_info("[path_b]   1. Press Volume Up once, then Volume Down once.");
+    log_info("[path_b]   2. Hold the Side button (keep holding past the Apple "
+             "logo until the recovery screen appears, cable connected).");
+    log_info("[path_b]   3. Release the Side button once the recovery screen "
+             "(computer icon / 'Connect to computer') shows.");
+    log_info("[path_b] Waiting up to %ds for verified recovery mode...",
+             RECOVERY_WAIT_SECS);
 
     while (elapsed < RECOVERY_WAIT_SECS) {
+        client = NULL;
+        mode   = 0;
+
+        err = irecv_open_with_ecid_and_attempts(
+            &client, dev->ecid != 0 ? (uint64_t)dev->ecid : 0, 3);
+        if (err == IRECV_E_SUCCESS && client) {
+            err = irecv_get_mode(client, &mode);
+            irecv_close(client);
+            client = NULL;
+
+            if (err == IRECV_E_SUCCESS &&
+                mode >= IRECV_K_RECOVERY_MODE_1 &&
+                mode <= IRECV_K_RECOVERY_MODE_4) {
+                dev->is_dfu_mode = 0;
+                log_info("[path_b] Recovery mode verified (mode=0x%04X, %ds)",
+                         (unsigned)mode, elapsed);
+                return 0;
+            }
+
+            if (err == IRECV_E_SUCCESS) {
+                last_mode = mode;
+                if (mode == IRECV_K_DFU_MODE && elapsed % 10 == 0)
+                    log_info("[path_b] Still in DFU -- keep holding the Side "
+                             "button until the recovery screen appears.");
+            } else {
+                log_debug("[path_b] irecv_get_mode failed: %s",
+                          irecv_strerror(err));
+            }
+        } else {
+            /* irecv could not open the device (e.g. transient, or the
+             * kernel driver still claims it).  Not necessarily fatal --
+             * recovery may be appearing.  Log so the wait is not silent. */
+            log_debug("[path_b] irecv open failed: %s",
+                      err != IRECV_E_SUCCESS ? irecv_strerror(err) : "NULL client");
+            if (elapsed % 10 == 0)
+                log_info("[path_b] Waiting for recovery... still scanning "
+                         "(%ds/%ds).", elapsed, RECOVERY_WAIT_SECS);
+        }
+
         usleep(REBOOT_POLL_USEC);
         elapsed += 2;
-
-        count = libusb_get_device_list(ctx, &devs);
-        if (count < 0) {
-            libusb_free_device_list(devs, 1);
-            continue;
-        }
-
-        for (i = 0; i < count && !found; i++) {
-            struct libusb_device_descriptor desc;
-            if (libusb_get_device_descriptor(devs[i], &desc) != LIBUSB_SUCCESS)
-                continue;
-            if (desc.idVendor == APPLE_VID_PATH_B &&
-                desc.idProduct == RECOVERY_PID_PATH_B)
-                found = 1;
-        }
-
-        libusb_free_device_list(devs, 1);
-
-        if (found) {
-            log_info("[path_b] Recovery mode detected (%ds)", elapsed);
-            libusb_exit(ctx);
-            return 0;
-        }
-
-        log_debug("[path_b] Waiting for recovery... %ds / %ds",
+        log_debug("[path_b] Waiting for verified recovery... %ds / %ds",
                   elapsed, RECOVERY_WAIT_SECS);
     }
 
-    libusb_exit(ctx);
-    log_error("[path_b] Timed out waiting for recovery mode (%ds)", RECOVERY_WAIT_SECS);
+    if (last_mode == IRECV_K_DFU_MODE)
+        log_error("[path_b] Timed out: the device stayed in DFU mode (PID 0x1227)");
+    else
+        log_error("[path_b] Timed out waiting for recovery mode (%ds)",
+                  RECOVERY_WAIT_SECS);
+    log_info("[path_b] Re-run the operation and repeat the Volume Up, Volume Down, "
+             "Side-button sequence.");
     return -1;
 }
 
